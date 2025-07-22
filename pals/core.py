@@ -37,7 +37,7 @@ class Locker:
 
         # pg_advisory_unlock_all is expensive, so we track which DB API connections
         # we used for lock and only run it on these.
-        self.tainted_connection_ids: Set[int] = set()
+        self._tainted_connection_ids = set()
 
         if create_engine_callable:
             self.engine = create_engine_callable()
@@ -57,8 +57,9 @@ class Locker:
                 # should already be released when the connection terminated.
                 return
 
-            if id(dbapi_connection) in self.tainted_connection_ids:
-                self.tainted_connection_ids.remove(id(dbapi_connection))
+            connection_id = id(dbapi_connection)
+            if connection_id in self._tainted_connection_ids:
+                self._tainted_connection_ids.remove(connection_id)
                 with dbapi_connection.cursor() as cur:
                     # If the connection is "closed" we want all locks to be cleaned up since this
                     # connection is going to be recycled.  This step is to take extra care that we don't
@@ -92,6 +93,9 @@ class Locker:
         kwargs.setdefault('acquire_timeout', self.acquire_timeout_default)
         return Lock(self, lock_num, name, **kwargs)
 
+    def _taint_connection(self, conn):
+        self._tainted_connection_ids.add(id(conn._dbapi_connection.dbapi_connection))
+
 
 class Lock:
     def __init__(
@@ -112,9 +116,7 @@ class Lock:
 
         if self.conn is None:
             self.conn = self.engine.connect()
-            self.parent.tainted_connection_ids.add(
-                id(self.conn._dbapi_connection.dbapi_connection)
-            )
+            self.parent._taint_connection(self.conn)
 
         if blocking:
             timeout_sql = sa.text("select set_config('lock_timeout', :timeout :: text, false)")
