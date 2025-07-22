@@ -35,6 +35,10 @@ class Locker:
         self.blocking_default = blocking_default
         self.acquire_timeout_default = acquire_timeout_default
 
+        # pg_advisory_unlock_all is expensive, so we track which DB API connections
+        # we used for lock and only run it on these.
+        self.tainted_connection_ids: Set[int] = set()
+
         if create_engine_callable:
             self.engine = create_engine_callable()
         else:
@@ -53,11 +57,13 @@ class Locker:
                 # should already be released when the connection terminated.
                 return
 
-            with dbapi_connection.cursor() as cur:
-                # If the connection is "closed" we want all locks to be cleaned up since this
-                # connection is going to be recycled.  This step is to take extra care that we don't
-                # accidentally leave a lock acquired.
-                cur.execute('select pg_advisory_unlock_all()')
+            if id(dbapi_connection) in self.tainted_connection_ids:
+                self.tainted_connection_ids.remove(id(dbapi_connection))
+                with dbapi_connection.cursor() as cur:
+                    # If the connection is "closed" we want all locks to be cleaned up since this
+                    # connection is going to be recycled.  This step is to take extra care that we don't
+                    # accidentally leave a lock acquired.
+                    cur.execute("select pg_advisory_unlock_all()")
 
     def _lock_name(self, name):
         if self.app_name is None:
@@ -84,12 +90,15 @@ class Locker:
         name = self._lock_name(name)
         kwargs.setdefault('blocking', self.blocking_default)
         kwargs.setdefault('acquire_timeout', self.acquire_timeout_default)
-        return Lock(self.engine, lock_num, name, **kwargs)
+        return Lock(self, lock_num, name, **kwargs)
 
 
 class Lock:
-    def __init__(self, engine, lock_num, name, blocking=None, acquire_timeout=None, shared=False):
-        self.engine = engine
+    def __init__(
+        self, parent, lock_num, name, blocking=None, acquire_timeout=None, shared=False
+    ):
+        self.parent = parent
+        self.engine = parent.engine
         self.conn = None
         self.lock_num = lock_num
         self.name = name
@@ -103,6 +112,9 @@ class Lock:
 
         if self.conn is None:
             self.conn = self.engine.connect()
+            self.parent.tainted_connection_ids.add(
+                id(self.conn._dbapi_connection.dbapi_connection)
+            )
 
         if blocking:
             timeout_sql = sa.text("select set_config('lock_timeout', :timeout :: text, false)")
