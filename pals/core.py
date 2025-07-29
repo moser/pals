@@ -116,7 +116,6 @@ class Lock:
 
         if self.conn is None:
             self.conn = self.engine.connect()
-            self.parent._taint_connection(self.conn)
 
         if blocking:
             timeout_sql = sa.text("select set_config('lock_timeout', :timeout :: text, false)")
@@ -136,6 +135,7 @@ class Lock:
             # when it acquires the lock.  pg_try_advisory_lock() returns True.
             # If pg_try_advisory_lock() fails, it returns False.
             if retval in (True, ''):
+                self.parent._taint_connection(self.conn)
                 return True
             else:
                 raise AcquireFailure(self.name, 'result was: {retval}')
